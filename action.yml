@@ -1,0 +1,33 @@
+name: 'nixpkgs-hammering-action'
+description: 'Run nixpkgs-hammering'
+author: 'Robert T. McGibbon'
+inputs:
+  token:
+    required: true
+    description: "your GITHUB_TOKEN"
+  nixpkgs_path:
+    description: "Path to the git repository"
+    default: .
+  exclude_rules:
+    description: description
+    default: attribute-ordering explicit-phases attribute-typo
+  exclude_files:
+    description: description
+    default: pkgs/misc/vim-plugins/generated.nix pkgs/misc/vim-plugins/overrides.nix pkgs/misc/tmux-plugins/default.nix
+  post_check:
+    description: description
+    default: true
+
+runs:
+  using: "composite"
+  steps:
+    - run: START_TIME=$(date +%s) nix run -f ${{ github.action_path }} -c hammering
+      shell: bash
+      env:
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_BASE: ${{ github.base_ref }}
+        INPUT_HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+        INPUT_NIXPKGS_PATH: ${{ inputs.nixpkgs_path }}
+        INPUT_EXCLUDE_RULES: ${{ inputs.exclude_rules }}
+        INPUT_EXCLUDE_FILES: ${{ inputs.exclude_files }}
+        INPUT_POST_CHECK: ${{ inputs.post_check }}

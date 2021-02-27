@@ -1,0 +1,365 @@
+#!/usr/bin/env python
+import argparse
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+from pprint import pprint
+from datetime import datetime
+from typing import Any, DefaultDict, Dict, List, Mapping, Optional, Set
+
+from git import Repo
+
+# https://github.com/jtojnar/nixpkgs-hammering/issues/73
+# https://github.com/jtojnar/nixpkgs-hammering/issues/77#issuecomment-786193493
+# https://github.com/jtojnar/nixpkgs-hammering/pull/78#pullrequestreview-599072677
+ATTRS_THAT_BREAK_NIXPKGS_HAMMER = {
+    "acl",
+    "attr",
+    "bash",
+    "binutils-unwrapped",
+    "bzip2",
+    "coreutils",
+    "coreutils-full",
+    "coreutils-prefixed",
+    "datadog-agent",
+    "diffutils",
+    "findutils",
+    "gawkInteractive",
+    "gcc-unwrapped",
+    "glibc",
+    "gnugrep",
+    "gnupatch",
+    "gnused",
+    "gnutar",
+    "gzip",
+    "holochain-go",
+    "javaPackages.junit_4_12",
+    "javaPackages.mavenHello_1_0",
+    "javaPackages.mavenHello_1_1",
+    "libgccjit",
+    "zfsbackup",
+}
+
+
+class GithubClient:
+    def __init__(self, api_token: Optional[str]) -> None:
+        self.api_token = api_token
+
+    def _request(
+        self, path: str, method: str, data: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        url = urllib.parse.urljoin("https://api.github.com/", path)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        if self.api_token:
+            headers["Authorization"] = f"token {self.api_token}"
+
+        body = None
+        if data:
+            body = json.dumps(data).encode("ascii")
+
+        req = urllib.request.Request(url, headers=headers, method=method, data=body)
+        try:
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            print(f"Url: {url}", file=sys.stderr)
+            print(f"Code: {e.code}", file=sys.stderr)
+            print(f"Reason: {e.reason}", file=sys.stderr)
+            print(f"Headers: {e.headers}", file=sys.stderr)
+            print(f"Data: {data}", file=sys.stderr)
+            raise
+
+        return json.loads(resp.read())
+
+    def get(self, path: str) -> Any:
+        return self._request(path, "GET")
+
+    def post(self, path: str, data: Dict[str, Any]) -> Any:
+        return self._request(path, "POST", data)
+
+    def create_check_run(
+        self,
+        owner: str,
+        repo: str,
+        head_sha: str,
+        hammering_report: Dict[str, List[Dict[str, Any]]],
+        started_at: datetime,
+    ):
+
+        # format hammering report in the way the github
+        # apo wants to see it
+        annotations = []
+        for attr, msgs in hammering_report.items():
+            for msg in msgs:
+                if len(msg["locations"]) == 1:
+                    location = msg["locations"][0]
+                assert msg["severity"] in ("notice", "warning", "failure")
+
+                annotations.append(
+                    {
+                        "path": location["file"],
+                        "start_line": int(location["line"]),
+                        "end_line": int(location["line"]),
+                        # "start_column": int(location["column"]),
+                        "annotation_level": msg["severity"],
+                        "message": textwrap.fill(msg["msg"].strip(), 80),
+                        "title": msg["name"],
+                    }
+                )
+        data = {
+            "name": "nixpkgs-hammering",
+            "head_sha": head_sha,
+            "status": "completed",
+            "started_at": started_at.astimezone().isoformat(),
+            "conclusion": "failure" if len(annotations) > 0 else "success",
+            "completed_at": datetime.now().astimezone().isoformat(),
+            "output": {
+                "title": "nixpkgs-hammering",
+                "summary": f"{len(annotations)} annotations emmitted by nixpkgs-hammering",
+                # "text": "Text of check run",
+                "annotations": annotations
+            },
+        }
+
+        pprint(data)
+
+        return self.post(f"repos/{owner}/{repo}/check-runs", data=data)
+
+
+def iwalk_nested_dict(indict: Dict[str, Any], pre=None):
+    pre = pre[:] if pre else []
+
+    if isinstance(indict, dict):
+        for key, value in indict.items():
+            if isinstance(value, dict):
+                yield from iwalk_nested_dict(value, pre + [key])
+            else:
+                yield pre + [key], value
+    else:
+        yield pre, indict
+
+
+def compute_nixpkgs_positions(nixpkgs_path: str) -> Dict[str, List[str]]:
+    """Compute a mapping from filename to a list of nixpkgs attrs defined
+    in that file
+    """
+    args = [
+        "nix-instantiate",
+        "--strict",
+        "--json",
+        "--eval",
+        "--option",
+        "plugin-files",
+        os.environ["NIX_PLUGINS"],
+        "-",
+        "--show-trace",
+    ]
+
+    recursiveFindAttrPositions = Path(__file__) / "../../lib/nixpkgsPositions.nix"
+    expr = textwrap.dedent(
+        f"""
+      let
+        pkgs = import {nixpkgs_path} {{ }};
+        recursiveFindAttrPositions = import {recursiveFindAttrPositions} {{ lib = pkgs.lib; }};
+      in
+        recursiveFindAttrPositions pkgs
+    """
+    )
+
+    json_text = subprocess.check_output(args, text=True, input=expr)
+    attr_to_position = json.loads(json_text)
+
+    # aggregate by file
+    result: Mapping[str, List[str]] = defaultdict(list)
+    for attr_path, position in iwalk_nested_dict(attr_to_position):
+        if position:
+            abs_file, line = position.split(":")
+            file = os.path.relpath(abs_file, nixpkgs_path)
+            result[file].append(".".join(attr_path))
+    return dict(result)
+
+
+def compute_changed_attrs(nixpkgs_path: str, changed_files: List[str]) -> List[str]:
+    # Determine nixpkgs attrs that have changed
+    file_to_attrs = compute_nixpkgs_positions(nixpkgs_path)
+    changed_attrs = []
+    for f in changed_files:
+        if f in file_to_attrs:
+            changed_attrs.extend(file_to_attrs[f])
+
+    return changed_attrs
+
+
+def compute_changed_files(nixpkgs_path: str, base: str) -> List[str]:
+    # Determine files that have changed in nixpkgs repo
+    repo = Repo(nixpkgs_path)
+    return [item.a_path for item in repo.index.diff(f"origin/{base}")]
+
+
+def green(msg: str) -> str:
+    return f"[1;32m{msg}[0m"
+
+
+def run_nixpkgs_hammering(
+    nixpkgs_path: str,
+    attrs: List[str],
+    exclude_rules: List[str],
+    exclude_files: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    cmd = [
+        "nixpkgs-hammer",
+        "-f",
+        nixpkgs_path,
+        "--json",
+    ]
+    for rule in exclude_rules:
+        cmd.extend(["--exclude", rule])
+    hammer_attrs = [a for a in attrs if (a not in ATTRS_THAT_BREAK_NIXPKGS_HAMMER)]
+    if len(hammer_attrs) == 0:
+        return {}
+
+    cmd.extend(hammer_attrs)
+
+    print(green("$ " + " ".join(cmd)), file=sys.stderr)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(os.path.abspath(os.getcwd()), file=sys.stderr)
+        print(e.stderr, file=sys.stderr)
+        print(e.stderr, file=sys.stderr)
+        print(e.returncode, file=sys.stderr)
+        raise
+    hammer_report = json.loads(proc.stdout)
+
+    # make paths relative to nixpkgs_path
+    for name, data in hammer_report.items():
+        for msg in data:
+            for location in msg.get("locations", []):
+                if "file" in location and isinstance(location["file"], str):
+                    location["file"] = os.path.relpath(location["file"], nixpkgs_path)
+
+    filtered_hammer_report = defaultdict(list)
+    for attr_name, data in hammer_report.items():
+        for msg in (
+            m
+            for m in data
+            if is_acceptable_hammer_message(m, nixpkgs_path, exclude_files)
+        ):
+            filtered_hammer_report[attr_name].append(msg)
+    return dict(filtered_hammer_report)
+
+
+def is_acceptable_hammer_message(
+    msg: Dict[str, Any], nixpkgs_path: str, exclude_files: List[str]
+) -> bool:
+    predicates = [
+        lambda: not is_ignored_file(msg, exclude_files),
+        lambda: not is_ignored_golang_buildFlagsArray_msg(msg, nixpkgs_path),
+        lambda: msg["name"] not in ("no-build-output",),
+    ]
+    return all(pred() for pred in predicates)
+
+
+def is_ignored_file(msg: Dict[str, Any], exclude_files: List[str]) -> bool:
+    return any(loc["file"] in exclude_files for loc in msg.get("locations", []))
+
+
+def is_ignored_golang_buildFlagsArray_msg(
+    msg: Dict[str, Any], nixpkgs_path: str
+) -> bool:
+    for loc in msg["locations"]:
+        is_golang = False
+        with open(os.path.join(nixpkgs_path, loc["file"])) as f:
+            content = f.read()
+            is_golang = "buildGoModule" in content or "buildGoPackage" in content
+
+        if is_golang and msg["name"] == "no-flags-array":
+            return True
+
+    return False
+
+
+def post_report(hammering_report: Dict[str, List[Dict[str, Any]]]) -> Optional[Dict]:
+    started_at = datetime.fromtimestamp(int(os.environ["START_TIME"]))
+    owner, repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+    head_sha = getInput("HEAD_SHA") or ""
+    if head_sha == "":
+        return None
+
+    gh = GithubClient(os.environ["INPUT_TOKEN"])
+    response = gh.create_check_run(
+        owner=owner,
+        repo=repo,
+        head_sha=head_sha,
+        started_at=started_at,
+        hammering_report=hammering_report,
+    )
+    return response
+
+
+def getInput(name: str) -> Optional[str]:
+    return os.environ.get("INPUT_" + name.replace(" ", "_").upper())
+
+
+def main():
+    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument(
+        "--nixpkgs-path", default=getInput("nixpkgs_path"), type=os.path.abspath
+    )
+    p.add_argument(
+        "--base",
+        default=getInput("base") or "master",
+    )
+    p.add_argument(
+        "--exclude-rules",
+        default=getInput("exclude_rules")
+        or "attribute-ordering explicit-phases attribute-typo",
+    )
+    p.add_argument(
+        "--exclude-files",
+        default=getInput("exclude_files")
+        or "pkgs/misc/vim-plugins/generated.nix pkgs/misc/vim-plugins/overrides.nix pkgs/misc/tmux-plugins/default.nix",
+    )
+
+    args = p.parse_args()
+
+    # # For debugging purposes
+    # if "GITHUB_ACTIONS" in os.environ:
+    #     pprint(dict(os.environ))
+    #     pass
+
+    changed_files = compute_changed_files(args.nixpkgs_path, args.base)
+    changed_attrs = compute_changed_attrs(args.nixpkgs_path, changed_files)
+    hammering_report = run_nixpkgs_hammering(
+        args.nixpkgs_path,
+        changed_attrs,
+        exclude_rules=args.exclude_rules.split(),
+        exclude_files=args.exclude_files.split(),
+    )
+    pprint(hammering_report)
+
+    if os.environ.get("GITHUB_ACTIONS") == "true" and (
+        getInput("post_check") in ("True", "true", "yes")
+    ):
+        response = post_report(hammering_report)
+        pprint(response)
+
+
+if __name__ == "__main__":
+    main()
